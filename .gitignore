@@ -71,7 +71,6 @@ venv.bak/
 
 # Model files and checkpoints
 checkpoints/
-models/
 weights/
 *.ckpt
 *.model
