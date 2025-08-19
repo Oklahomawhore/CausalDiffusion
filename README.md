@@ -2,6 +2,8 @@
 
 ### [Paper](https://arxiv.org/abs/2506.19852) | [Website](https://hanlab.mit.edu/projects/radial-attention)
 
+**[2025-08-04]** Radial Attention is now supports [Lightx2v](https://github.com/ModelTC/LightX2V), a 4-step LoRA. Radial Attention also supports [SageAttention2++](https://arxiv.org/abs/2505.21136) for FP8 Matmul accumulation on 4090. With the joint effort of **Radial Attention, SageAttention and Lightx2v LoRA**, now it only takes **33/90 seconds to generate a high-fidelity video for Wan2.1 on a single H100/4090 GPU respectively!**.
+
 **[2025-07-22]** Radial Attention is now compatible with [SageAttention](https://github.com/thu-ml/SageAttention) version 2!
 
 **[2025-07-14]** Radial Attention is now compatible with [SageAttention](https://github.com/thu-ml/SageAttention) version 1!
@@ -84,7 +86,10 @@ pip install flash-attn --no-build-isolation
 # 4. Install FlashInfer for fast and hardware-friendly inference
 pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
 
-# 5. (Optional) Install Sparse_SageAttention for further acceleration
+# 5. Install Latest Diffusers to try lightx2v features and Wan2.2
+pip install git+https://github.com/huggingface/diffusers
+
+# 6. (Optional) Install Sparse_SageAttention for further acceleration
 cd third_party/SageAttention/ # install SageAttention
 export EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" MAX_JOBS=32 # parallel compiling (Optional)
 python setup.py install  # or pip install -e .

@@ -1,5 +1,3 @@
-# borrowed from svg-project/Sparse-VideoGen
-
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -13,21 +11,25 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.pipelines.wan.pipeline_output import WanPipelineOutput
 
-class WanTransformerBlock_Sparse(WanTransformerBlock):
+class Wan22TransformerBlock_Sparse(WanTransformerBlock):
+    """
+    Wan2.2 compatible transformer block with sparse attention support.
+    Handles both expand_timesteps mode and regular timestep modes.
+    """
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
-        numeral_timestep: Optional[int] = None,
+        numeral_timestep: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
-            # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
+            # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v with expand_timesteps)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
                 self.scale_shift_table.unsqueeze(0) + temb.float()
             ).chunk(6, dim=2)
-            # batch_size, seq_len, 1, inner_dim
+            # batch_size, seq_len, 1, inner_dim -> batch_size, seq_len, inner_dim
             shift_msa = shift_msa.squeeze(2)
             scale_msa = scale_msa.squeeze(2)
             gate_msa = gate_msa.squeeze(2)
@@ -59,13 +61,17 @@ class WanTransformerBlock_Sparse(WanTransformerBlock):
 
         return hidden_states
 
-class WanTransformer3DModel_Sparse(WanTransformer3DModel):
+class Wan22Transformer3DModel_Sparse(WanTransformer3DModel):
+    """
+    Wan2.2 compatible 3D transformer model with sparse attention support.
+    Handles expand_timesteps feature for fine-grained temporal control.
+    """
     def forward(
         self,
         hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
         encoder_hidden_states: torch.Tensor,
-        numeral_timestep: Optional[int] = None,
+        numeral_timestep: Optional[Union[int, torch.Tensor]] = None,
         encoder_hidden_states_image: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -96,10 +102,10 @@ class WanTransformer3DModel_Sparse(WanTransformer3DModel):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
+        # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v with expand_timesteps)
         if timestep.ndim == 2:
             ts_seq_len = timestep.shape[1]
-            timestep = timestep.flatten() # batch_size * seq_len
+            timestep = timestep.flatten()  # batch_size * seq_len
         else:
             ts_seq_len = None
 
@@ -135,7 +141,7 @@ class WanTransformer3DModel_Sparse(WanTransformer3DModel):
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
-            # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
+            # batch_size, seq_len, inner_dim (wan 2.2 ti2v with expand_timesteps)
             shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
             shift = shift.squeeze(2)
             scale = scale.squeeze(2)
@@ -168,17 +174,22 @@ class WanTransformer3DModel_Sparse(WanTransformer3DModel):
 
         return Transformer2DModelOutput(sample=output)
     
-class WanPipeline_Sparse(WanPipeline):
+class Wan22Pipeline_Sparse(WanPipeline):
+    """
+    Wan2.2 compatible pipeline with sparse attention support.
+    Handles both single-stage and two-stage denoising with expand_timesteps feature.
+    """
     @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
-        height: int = 480,
-        width: int = 832,
-        num_frames: int = 81,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
+        height: int = 720,
+        width: int = 1280,
+        num_frames: int = 49,
+        num_inference_steps: int = 40,
+        guidance_scale: float = 4.0,
+        guidance_scale_2: Optional[float] = 3.0,
         num_videos_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.Tensor] = None,
@@ -193,69 +204,10 @@ class WanPipeline_Sparse(WanPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
     ):
-        r"""
-        The call function to the pipeline for generation.
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.
-            height (`int`, defaults to `480`):
-                The height in pixels of the generated image.
-            width (`int`, defaults to `832`):
-                The width in pixels of the generated image.
-            num_frames (`int`, defaults to `81`):
-                The number of frames in the generated video.
-            num_inference_steps (`int`, defaults to `50`):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            guidance_scale (`float`, defaults to `5.0`):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-                usually at the expense of lower image quality.
-            num_videos_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
-                generation deterministic.
-            latents (`torch.Tensor`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
-                provided, text embeddings are generated from the `prompt` input argument.
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`WanPipelineOutput`] instead of a plain tuple.
-            attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            callback_on_step_end (`Callable`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
-                A function or a subclass of `PipelineCallback` or `MultiPipelineCallbacks` that is called at the end of
-                each denoising step during the inference. with the following arguments: `callback_on_step_end(self:
-                DiffusionPipeline, step: int, timestep: int, callback_kwargs: Dict)`. `callback_kwargs` will include a
-                list of all tensors as specified by `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`List`, *optional*):
-                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
-                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
-                `._callback_tensor_inputs` attribute of your pipeline class.
-            autocast_dtype (`torch.dtype`, *optional*, defaults to `torch.bfloat16`):
-                The dtype to use for the torch.amp.autocast.
-
-        Examples:
-
-        Returns:
-            [`~WanPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`WanPipelineOutput`] is returned, otherwise a `tuple` is returned where
-                the first element is a list with the generated images and the second element is a list of `bool`s
-                indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-
+        Enhanced call function for Wan2.2 pipeline with sparse attention support.
+        Supports both single and dual transformer configurations.
+        """
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
@@ -268,9 +220,21 @@ class WanPipeline_Sparse(WanPipeline):
             prompt_embeds,
             negative_prompt_embeds,
             callback_on_step_end_tensor_inputs,
+            guidance_scale_2,
         )
 
+        if num_frames % self.vae_scale_factor_temporal != 1:
+            logger.warning(
+                f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
+            )
+            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+        num_frames = max(num_frames, 1)
+
+        if self.config.boundary_ratio is not None and guidance_scale_2 is None:
+            guidance_scale_2 = guidance_scale
+
         self._guidance_scale = guidance_scale
+        self._guidance_scale_2 = guidance_scale_2
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
         self._interrupt = False
@@ -297,7 +261,7 @@ class WanPipeline_Sparse(WanPipeline):
             device=device,
         )
 
-        transformer_dtype = self.transformer.dtype
+        transformer_dtype = self.transformer.dtype if self.transformer is not None else self.transformer_2.dtype
         prompt_embeds = prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
@@ -307,7 +271,11 @@ class WanPipeline_Sparse(WanPipeline):
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels
+        num_channels_latents = (
+            self.transformer.config.in_channels
+            if self.transformer is not None
+            else self.transformer_2.config.in_channels
+        )
         latents = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
@@ -320,9 +288,17 @@ class WanPipeline_Sparse(WanPipeline):
             latents,
         )
 
+        # Prepare mask for expand_timesteps feature
+        mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
+
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+
+        if self.config.boundary_ratio is not None:
+            boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+        else:
+            boundary_timestep = None
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -330,28 +306,46 @@ class WanPipeline_Sparse(WanPipeline):
                     continue
 
                 self._current_timestep = t
+
+                if boundary_timestep is None or t >= boundary_timestep:
+                    # wan2.1 or high-noise stage in wan2.2
+                    current_model = self.transformer
+                    current_guidance_scale = guidance_scale
+                else:
+                    # low-noise stage in wan2.2
+                    current_model = self.transformer_2
+                    current_guidance_scale = guidance_scale_2
+
                 latent_model_input = latents.to(transformer_dtype)
-                timestep = t.expand(latents.shape[0])
+                if self.config.expand_timesteps:
+                    # seq_len: num_latent_frames * latent_height//2 * latent_width//2
+                    temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
+                    # batch_size, seq_len
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    timestep = t.expand(latents.shape[0])
 
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                    numeral_timestep=i,
-                )[0]
-
-                if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
+                with current_model.cache_context("cond"):
+                    noise_pred = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                         numeral_timestep=i,
                     )[0]
-                    noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
+                if self.do_classifier_free_guidance:
+                    with current_model.cache_context("uncond"):
+                        noise_uncond = current_model(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                            numeral_timestep=i,
+                        )[0]
+                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
@@ -369,7 +363,6 @@ class WanPipeline_Sparse(WanPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-
 
         self._current_timestep = None
 
@@ -397,7 +390,8 @@ class WanPipeline_Sparse(WanPipeline):
 
         return WanPipelineOutput(frames=video)
 
-def replace_sparse_forward():
-    WanTransformerBlock.forward = WanTransformerBlock_Sparse.forward
-    WanTransformer3DModel.forward = WanTransformer3DModel_Sparse.forward
-    WanPipeline.__call__ = WanPipeline_Sparse.__call__
+def replace_wan22_sparse_forward():
+    """Replace forward methods with sparse attention versions for Wan2.2"""
+    WanTransformerBlock.forward = Wan22TransformerBlock_Sparse.forward
+    WanTransformer3DModel.forward = Wan22Transformer3DModel_Sparse.forward
+    WanPipeline.__call__ = Wan22Pipeline_Sparse.__call__

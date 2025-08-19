@@ -6,6 +6,13 @@ from einops import rearrange, repeat
 from sageattention import sageattn
 from spas_sage_attn import block_sparse_sage2_attn_cuda
 
+def get_cuda_arch_versions():
+    cuda_archs = []
+    for i in range(torch.cuda.device_count()):
+        major, minor = torch.cuda.get_device_capability(i)
+        cuda_archs.append(f"sm{major}{minor}")
+    return cuda_archs
+
 # try to import block_sparse_sage2_attn_cuda from spas_sage_attn, if it fails, use the one from sparse_sageattn
 try:
     from spas_sage_attn import block_sparse_sage2_attn_cuda
@@ -13,17 +20,25 @@ except ImportError:
     print("Using sparse_sageattn as block_sparse_sage2_attn_cuda")
     from sparse_sageattn import sparse_sageattn as block_sparse_sage2_attn_cuda
 
-def sparge_mask_convert(mask: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+def sparge_mask_convert(mask: torch.Tensor, block_size: int = 128, arch="sm") -> torch.Tensor:
     assert block_size in [128, 64], "Radial Attention only supports block size of 128 or 64"
     assert mask.shape[0] == mask.shape[1], "Input mask must be square."
 
     if block_size == 128:
-        new_mask = torch.repeat_interleave(mask, 2, dim=1)
+        if arch == "sm90":
+            new_mask = torch.repeat_interleave(mask, 2, dim=0)
+        else:
+            new_mask = torch.repeat_interleave(mask, 2, dim=1)
         
     elif block_size == 64:
-        num_row, num_col = mask.shape
-        reshaped_mask = mask.view(num_row // 2, 2, num_col)
-        new_mask = torch.max(reshaped_mask, dim=1).values
+        if arch == "sm90":
+            num_row, num_col = mask.shape
+            reshaped_mask = mask.view(num_row, num_col // 2, 2)
+            new_mask = torch.max(reshaped_mask, dim=2).values
+        else:
+            num_row, num_col = mask.shape
+            reshaped_mask = mask.view(num_row // 2, 2, num_col)
+            new_mask = torch.max(reshaped_mask, dim=1).values
 
     return new_mask
 
@@ -342,9 +357,7 @@ class MaskMap:
     def queryLogMask(self, query, sparse_type, block_size=128, decay_factor=0.5, model_type=None):
         if MaskMap._log_mask is None:
             MaskMap._log_mask = torch.ones((query.shape[0] // block_size, query.shape[0] // block_size), device=query.device, dtype=torch.bool)
-            block_bound = self.video_token_num // block_size
-            MaskMap._log_mask[:block_bound, :block_bound] = gen_log_mask_shrinked(query, query.shape[0], self.video_token_num, self.num_frame, sparse_type=sparse_type, decay_factor=decay_factor, model_type=model_type, block_size=block_size)
-            MaskMap._log_mask[:block_bound, :block_bound] = MaskMap._log_mask[:block_bound, :block_bound]
+            MaskMap._log_mask = gen_log_mask_shrinked(query, query.shape[0], self.video_token_num, self.num_frame, sparse_type=sparse_type, decay_factor=decay_factor, model_type=model_type, block_size=block_size)
         return MaskMap._log_mask
 
 class SceneAwareMaskMap(MaskMap):
@@ -411,7 +424,8 @@ def SpargeSageAttnBackend(query, key, value, mask_map=None, video_mask=None, pre
     query_hnd = rearrange(query.unsqueeze(0), "b s h d -> b h s d")
     key_hnd = rearrange(key.unsqueeze(0), "b s h d -> b h s d")
     value_hnd = rearrange(value.unsqueeze(0), "b s h d -> b h s d")
-    converted_mask = repeat(sparge_mask_convert(mask=video_mask, block_size=block_size), "s t -> b h s t", b=query_hnd.shape[0], h=query_hnd.shape[1])
+    arch = get_cuda_arch_versions()[query.device.index]
+    converted_mask = repeat(sparge_mask_convert(mask=video_mask, block_size=block_size, arch=arch), "s t -> b h s t", b=query_hnd.shape[0], h=query_hnd.shape[1])
     
     converted_mask = converted_mask.to(torch.int8)
     if pre_defined_mask is None:
@@ -437,7 +451,7 @@ def SpargeSageAttnBackend(query, key, value, mask_map=None, video_mask=None, pre
         query_video,
         key_video,
         value_video,
-        mask_id=converted_mask[:, :, :mask_map.video_token_num // block_size, :],
+        mask_id=converted_mask[:, :, :mask_map.video_token_num // block_size, :].contiguous(),
         tensor_layout="HND",
     )
     

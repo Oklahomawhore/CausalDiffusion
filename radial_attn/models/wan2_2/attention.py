@@ -9,7 +9,10 @@ from einops import rearrange
 from ...attn_mask import RadialAttention
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-class WanSparseAttnProcessor:
+class Wan22SparseAttnProcessor:
+    """
+    Radial attention processor for Wan2.2 model with support for expand_timesteps feature.
+    """
     _attention_backend = None
     mask_map = None
     dense_timestep = 0
@@ -21,7 +24,7 @@ class WanSparseAttnProcessor:
     def __init__(self, layer_idx: int):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(
-                "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
+                "Wan22SparseAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
             )
         self.layer_idx = layer_idx
 
@@ -51,7 +54,6 @@ class WanSparseAttnProcessor:
         value = value.unflatten(2, (attn.heads, -1))
 
         if rotary_emb is not None:
-
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
                 freqs_cos: torch.Tensor,
@@ -96,32 +98,30 @@ class WanSparseAttnProcessor:
                 )
                 
         else: # case for sparse attention
-            batch_size = query.shape[0]
-            # transform (batch_size, num_heads, seq_len, head_dim) to (seq_len * batch_size, num_heads, head_dim)
-            query = rearrange(query, "b s h d -> (b s) h d")
-            key = rearrange(key, "b s h d -> (b s) h d")
-            value = rearrange(value, "b s h d -> (b s) h d")
-            if numerical_timestep < self.dense_timestep or self.layer_idx < self.dense_block or self.sparse_type == "dense":
-                hidden_states = RadialAttention(
-                    query=query, key=key, value=value, mask_map=self.mask_map, sparsity_type="dense", block_size=128, decay_factor=self.decay_factor, model_type="wan", pre_defined_mask=None, use_sage_attention=self.use_sage_attention
+            
+            # Handle both scalar and tensor numerical_timestep for wan2.2 compatibility
+            timestep_value = numerical_timestep
+            if torch.is_tensor(numerical_timestep):
+                timestep_value = numerical_timestep.item() if numerical_timestep.numel() == 1 else numerical_timestep[0].item()
+            
+            if timestep_value < self.dense_timestep or self.layer_idx < self.dense_block or self.sparse_type == "dense":
+                hidden_states = dispatch_attention_fn(
+                    query=query, key=key, value=value,
+                    attn_mask=attention_mask, dropout_p=0.0, is_causal=False, backend=self._attention_backend,
                 )
             else:
+                batch_size = query.shape[0]
+                # transform (batch_size, num_heads, seq_len, head_dim) to (seq_len * batch_size, num_heads, head_dim)
+                query = rearrange(query, "b s h d -> (b s) h d")
+                key = rearrange(key, "b s h d -> (b s) h d")
+                value = rearrange(value, "b s h d -> (b s) h d")
                 # apply radial attention
                 hidden_states = RadialAttention(
-                    query=query, key=key, value=value, mask_map=self.mask_map, sparsity_type="radial", block_size=128, decay_factor=self.decay_factor, model_type="wan", pre_defined_mask=None, use_sage_attention=self.use_sage_attention
+                    query=query, key=key, value=value, mask_map=self.mask_map, sparsity_type="radial", block_size=64, decay_factor=self.decay_factor, model_type="wan", pre_defined_mask=None, use_sage_attention=self.use_sage_attention
                 )
-            # transform back to (batch_size, num_heads, seq_len, head_dim)
-            hidden_states = rearrange(hidden_states, "(b s) h d -> b s h d", b=batch_size)
+                # transform back to (batch_size, num_heads, seq_len, head_dim)
+                hidden_states = rearrange(hidden_states, "(b s) h d -> b s h d", b=batch_size)
 
-        # hidden_states = dispatch_attention_fn(
-        #     query,
-        #     key,
-        #     value,
-        #     attn_mask=attention_mask,
-        #     dropout_p=0.0,
-        #     is_causal=False,
-        #     backend=self._attention_backend,
-        # )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -133,17 +133,20 @@ class WanSparseAttnProcessor:
         return hidden_states
 
 
-class WanSparseAttnProcessor2_0: # the previous version is deprecated, fall back to WanAttnProcessor
+class Wan22SparseAttnProcessor2_0:
+    """
+    Alternative processor for Wan2.2 with different tensor reshaping approach.
+    """
     mask_map = None
     dense_timestep = 0
     dense_block = 0
     decay_factor = 1.0
-    sparse_type = "radial"  # default to radial attention, can be changed to "dense" for dense attention
+    sparse_type = "radial"
     use_sage_attention = False
     
     def __init__(self, layer_idx):
         if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError("WanAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
+            raise ImportError("Wan22SparseAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
         self.layer_idx = layer_idx
         
     def __call__(
@@ -162,12 +165,7 @@ class WanSparseAttnProcessor2_0: # the previous version is deprecated, fall back
             image_context_length = encoder_hidden_states.shape[1] - 512
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-        encoder_hidden_states_img = None
-        if attn.add_k_proj is not None:
-            # 512 is the context length of the text encoder, hardcoded for now
-            image_context_length = encoder_hidden_states.shape[1] - 512
-            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
-            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+            
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -185,7 +183,6 @@ class WanSparseAttnProcessor2_0: # the previous version is deprecated, fall back
         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
 
         if rotary_emb is not None:
-
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
                 freqs_cos: torch.Tensor,
@@ -230,7 +227,13 @@ class WanSparseAttnProcessor2_0: # the previous version is deprecated, fall back
             query = rearrange(query, "b h s d -> (b s) h d")
             key = rearrange(key, "b h s d -> (b s) h d")
             value = rearrange(value, "b h s d -> (b s) h d")
-            if numeral_timestep < self.dense_timestep or self.layer_idx < self.dense_block or self.sparse_type == "dense":
+            
+            # Handle both scalar and tensor numerical_timestep for wan2.2 compatibility
+            timestep_value = numeral_timestep
+            if torch.is_tensor(numeral_timestep):
+                timestep_value = numeral_timestep.item() if numeral_timestep.numel() == 1 else numeral_timestep[0].item()
+            
+            if timestep_value < self.dense_timestep or self.layer_idx < self.dense_block or self.sparse_type == "dense":
                 hidden_states = RadialAttention(
                     query=query, key=key, value=value, mask_map=self.mask_map, sparsity_type="dense", block_size=128, decay_factor=self.decay_factor, model_type="wan", pre_defined_mask=None, use_sage_attention=self.use_sage_attention
                 )
@@ -241,6 +244,7 @@ class WanSparseAttnProcessor2_0: # the previous version is deprecated, fall back
                 )
             # transform back to (batch_size, num_heads, seq_len, head_dim)
             hidden_states = rearrange(hidden_states, "(b s) h d -> b h s d", b=batch_size)
+            
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
