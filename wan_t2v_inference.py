@@ -43,7 +43,7 @@ if __name__ == "__main__":
     replace_sparse_forward()
     
     # Available models: Wan-AI/Wan2.1-T2V-14B-Diffusers, Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-    model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+    model_id = args.model_id
     vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
     flow_shift = args.flow_shift
     text_encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=torch.bfloat16)

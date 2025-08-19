@@ -1,1 +1,116 @@
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# CUDA compilation
+*.o
+*.lo
+*.la
+*.al
+.libs
+*.so.*
+*.a
+*.pyc
+*.pyo
+
+# Model files and checkpoints
+checkpoints/
+models/
+weights/
+*.ckpt
+*.model
+
+# Data files
+data/
+datasets/
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.parquet
+
+# Logs and outputs
+logs/
+outputs/
+results/
+experiments/
+wandb/
+tensorboard_logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated content
+generated/
+output/
+samples/
+
+# Configuration files that might contain secrets
+config.json
+secrets.json
+.env.local
+.env.production

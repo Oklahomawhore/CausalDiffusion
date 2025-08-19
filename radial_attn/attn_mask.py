@@ -1,7 +1,7 @@
 import torch
 import flashinfer
 import matplotlib.pyplot as plt
-from sparse_sageattn import sparse_sageattn
+# from spas_sage_attn import sparse_sageattn
 from einops import rearrange, repeat
 from sageattention import sageattn
 from spas_sage_attn import block_sparse_sage2_attn_cuda
@@ -104,6 +104,15 @@ def get_window_width(i, j, token_per_frame, sparse_type, num_frame, decay_factor
     elif model_type == "hunyuan":
         if dist <= 1:
             return token_per_frame
+    elif model_type == "cogvideox":
+        # CogVideoX径向注意力策略
+        if dist == 0:
+            return token_per_frame  # 同一帧内的全连接
+        elif dist == 1:
+            return token_per_frame // 2  # 相邻帧半连接
+        else:
+            # 远距离帧使用径向衰减
+            pass
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     group = dist.bit_length()
@@ -157,6 +166,172 @@ def gen_log_mask_shrinked(query, s, video_token_num, num_frame, block_size=128, 
     print(f"mask sparsity: {1 - final_log_mask.sum() / final_log_mask.numel()}")
     return final_log_mask
 
+def get_scene_adjacency_matrix(num_frame, scene_boundaries=None, scene_attention_type="adjacent"):
+    """
+    Generate scene-level adjacency matrix to control inter-scene attention.
+    
+    Args:
+        num_frame: Total number of frames
+        scene_boundaries: List of frame indices marking scene boundaries, e.g., [0, 10, 20, 30]
+        scene_attention_type: Type of scene attention ("adjacent" or "all")
+    
+    Returns:
+        adjacency_matrix: (num_frame, num_frame) boolean tensor indicating which frames can attend
+    """
+    adjacency_matrix = torch.zeros((num_frame, num_frame), dtype=torch.bool)
+    
+    if scene_boundaries is None:
+        # If no scene boundaries provided, default to adjacent frame attention
+        for i in range(num_frame):
+            for j in range(max(0, i-1), min(num_frame, i+2)):
+                adjacency_matrix[i, j] = True
+        return adjacency_matrix
+    
+    # Assign each frame to a scene
+    scene_ids = torch.zeros(num_frame, dtype=torch.long)
+    for i, boundary in enumerate(scene_boundaries[1:], 1):
+        scene_ids[scene_boundaries[i-1]:boundary] = i-1
+    
+    num_scenes = len(scene_boundaries) - 1
+    
+    if scene_attention_type == "adjacent":
+        # Adjacent scenes can attend to each other
+        scene_adjacency = torch.zeros((num_scenes, num_scenes), dtype=torch.bool)
+        for i in range(num_scenes):
+            for j in range(max(0, i-1), min(num_scenes, i+2)):
+                scene_adjacency[i, j] = True
+    elif scene_attention_type == "all":
+        # All scenes can attend to each other
+        scene_adjacency = torch.ones((num_scenes, num_scenes), dtype=torch.bool)
+    else:
+        raise ValueError(f"Unsupported scene_attention_type: {scene_attention_type}")
+    
+    # Convert scene-level adjacency to frame-level adjacency
+    for i in range(num_frame):
+        for j in range(num_frame):
+            scene_i = scene_ids[i]
+            scene_j = scene_ids[j]
+            if scene_adjacency[scene_i, scene_j]:
+                adjacency_matrix[i, j] = True
+    
+    return adjacency_matrix
+
+def apply_scene_adjacency_to_mask(frame_mask, scene_boundaries, scene_adjacency_matrix):
+    """
+    Apply scene-level adjacency constraints to frame-level mask.
+    
+    Args:
+        frame_mask: (num_frame, num_frame) boolean tensor - frame-level attention mask
+        scene_boundaries: 1D array of scene boundary frame indices, e.g., [0, 10, 20, 30]
+        scene_adjacency_matrix: 2D array indicating which scenes can attend to each other
+    
+    Returns:
+        filtered_mask: Frame-level mask filtered by scene adjacency
+    """
+    num_frame = frame_mask.shape[0]
+    
+    # Assign each frame to a scene
+    scene_ids = torch.zeros(num_frame, dtype=torch.long, device=frame_mask.device)
+    for i, boundary in enumerate(scene_boundaries[1:], 1):
+        scene_ids[scene_boundaries[i-1]:boundary] = i-1
+    
+    # Convert scene adjacency matrix to tensor if it's not already
+    if not isinstance(scene_adjacency_matrix, torch.Tensor):
+        scene_adjacency_matrix = torch.tensor(scene_adjacency_matrix, dtype=torch.bool, device=frame_mask.device)
+    else:
+        scene_adjacency_matrix = scene_adjacency_matrix.to(frame_mask.device)
+    
+    # Apply scene-level constraints
+    filtered_mask = frame_mask.clone()
+    for i in range(num_frame):
+        for j in range(num_frame):
+            scene_i = scene_ids[i]
+            scene_j = scene_ids[j]
+            if not scene_adjacency_matrix[scene_i, scene_j]:
+                filtered_mask[i, j] = False
+    
+    return filtered_mask
+
+def gen_log_mask_shrinked_with_scene_dynamic(query, s, video_token_num, num_frame, block_size=128, sparse_type="log", decay_factor=0.5, model_type=None, scene_boundaries=None, scene_adjacency_matrix=None):
+    """
+    Generate attention mask with dynamic scene-level sparsity.
+    
+    Args:
+        scene_boundaries: 1D array of frame indices marking scene boundaries, e.g., [0, 10, 20, 30]
+        scene_adjacency_matrix: 2D array (num_scenes, num_scenes) indicating which scenes can attend to each other
+    """
+    final_log_mask = torch.zeros((s // block_size, s // block_size), device=query.device, dtype=torch.bool)
+    token_per_frame = video_token_num // num_frame
+    video_text_border = video_token_num // block_size
+
+    col_indices = torch.arange(0, token_per_frame, device=query.device).view(1, -1)
+    row_indices = torch.arange(0, token_per_frame, device=query.device).view(-1, 1)
+    
+    # Text tokens can attend to everything
+    final_log_mask[video_text_border:] = True
+    final_log_mask[:, video_text_border:] = True
+    
+    # Pre-compute scene assignments if scene boundaries are provided
+    scene_frame_mask = None
+    if scene_boundaries is not None and scene_adjacency_matrix is not None:
+        # Create frame-to-frame scene adjacency mask
+        scene_ids = torch.zeros(num_frame, dtype=torch.long, device=query.device)
+        for i, boundary in enumerate(scene_boundaries[1:], 1):
+            scene_ids[scene_boundaries[i-1]:boundary] = i-1
+        
+        # Convert scene adjacency matrix to tensor if needed
+        if not isinstance(scene_adjacency_matrix, torch.Tensor):
+            scene_adjacency_matrix = torch.tensor(scene_adjacency_matrix, dtype=torch.bool, device=query.device)
+        else:
+            scene_adjacency_matrix = scene_adjacency_matrix.to(query.device)
+        
+        # Pre-compute frame-level scene mask
+        scene_frame_mask = torch.zeros((num_frame, num_frame), dtype=torch.bool, device=query.device)
+        for i in range(num_frame):
+            for j in range(num_frame):
+                scene_i = scene_ids[i]
+                scene_j = scene_ids[j]
+                scene_frame_mask[i, j] = scene_adjacency_matrix[scene_i, scene_j]
+    
+    for i in range(num_frame):
+        for j in range(num_frame):
+            local_mask = torch.zeros((token_per_frame, token_per_frame), device=query.device, dtype=torch.bool)
+            
+            # Check scene-level adjacency first (if provided)
+            if scene_frame_mask is not None and not scene_frame_mask[i, j]:
+                # If scenes are not allowed to attend according to adjacency matrix, skip
+                pass
+            elif j == 0 and model_type == "wan":  # attention sink
+                local_mask = torch.ones((token_per_frame, token_per_frame), device=query.device, dtype=torch.bool)
+            else:
+                # Apply frame-level radial attention pattern
+                window_width = get_window_width(i, j, token_per_frame, sparse_type, num_frame, decay_factor=decay_factor, block_size=block_size, model_type=model_type)
+                local_mask = torch.abs(col_indices - row_indices) <= window_width
+                split_mask = get_diagonal_split_mask(i, j, token_per_frame, sparse_type, query)
+                local_mask = torch.logical_and(local_mask, split_mask)
+
+            remainder_row = (i * token_per_frame) % block_size
+            remainder_col = (j * token_per_frame) % block_size
+            # get the padded size
+            all_length_row = remainder_row + ((token_per_frame - 1) // block_size + 1) * block_size
+            all_length_col = remainder_col + ((token_per_frame - 1) // block_size + 1) * block_size
+            padded_local_mask = torch.zeros((all_length_row, all_length_col), device=query.device, dtype=torch.bool)
+            padded_local_mask[remainder_row:remainder_row + token_per_frame, remainder_col:remainder_col + token_per_frame] = local_mask
+            
+            # shrink the mask
+            block_mask = shrinkMaskStrict(padded_local_mask, block_size=block_size)
+            
+            # set the block mask to the final log mask
+            block_row_start = (i * token_per_frame) // block_size
+            block_col_start = (j * token_per_frame) // block_size
+            block_row_end = block_row_start + block_mask.shape[0]
+            block_col_end = block_col_start + block_mask.shape[1]
+            final_log_mask[block_row_start:block_row_end, block_col_start:block_col_end] = torch.logical_or(
+                final_log_mask[block_row_start:block_row_end, block_col_start:block_col_end], block_mask)
+    
+    print(f"mask sparsity: {1 - final_log_mask.sum() / final_log_mask.numel()}")
+    return final_log_mask
+
 class MaskMap:
     _log_mask = None
 
@@ -171,6 +346,43 @@ class MaskMap:
             MaskMap._log_mask[:block_bound, :block_bound] = gen_log_mask_shrinked(query, query.shape[0], self.video_token_num, self.num_frame, sparse_type=sparse_type, decay_factor=decay_factor, model_type=model_type, block_size=block_size)
             MaskMap._log_mask[:block_bound, :block_bound] = MaskMap._log_mask[:block_bound, :block_bound]
         return MaskMap._log_mask
+
+class SceneAwareMaskMap(MaskMap):
+    """Scene-aware mask map that computes scene-level sparsity on-the-fly."""
+    
+    def __init__(self, video_token_num=25440, num_frame=16, scene_boundaries=None, scene_adjacency_matrix=None):
+        super().__init__(video_token_num, num_frame)
+        self.scene_boundaries = scene_boundaries
+        self.scene_adjacency_matrix = scene_adjacency_matrix
+
+    def queryLogMask(self, query, sparse_type, block_size=128, decay_factor=0.5, model_type=None):
+        # Always compute on-the-fly, don't cache
+        log_mask = torch.ones((query.shape[0] // block_size, query.shape[0] // block_size), device=query.device, dtype=torch.bool)
+        block_bound = self.video_token_num // block_size
+        
+        # Use scene-aware generation if scene info is provided
+        if self.scene_boundaries is not None and self.scene_adjacency_matrix is not None:
+            log_mask[:block_bound, :block_bound] = gen_log_mask_shrinked_with_scene_dynamic(
+                query, query.shape[0], self.video_token_num, self.num_frame, 
+                sparse_type=sparse_type, decay_factor=decay_factor, model_type=model_type, 
+                block_size=block_size, scene_boundaries=self.scene_boundaries, 
+                scene_adjacency_matrix=self.scene_adjacency_matrix
+            )
+        else:
+            # Fallback to regular generation
+            log_mask[:block_bound, :block_bound] = gen_log_mask_shrinked(
+                query, query.shape[0], self.video_token_num, self.num_frame, 
+                sparse_type=sparse_type, decay_factor=decay_factor, model_type=model_type, 
+                block_size=block_size
+            )
+        
+        return log_mask
+
+# Update the HierarchyMaskMap to inherit from SceneAwareMaskMap for backward compatibility
+class HiearchyMaskMap(SceneAwareMaskMap):
+    
+    def __init__(self, video_token_num=25440, num_frame=16, scene_boundaries=None, scene_adjacency_matrix=None):
+        super().__init__(video_token_num, num_frame, scene_boundaries, scene_adjacency_matrix)
 
 def SpargeSageAttnBackend(query, key, value, mask_map=None, video_mask=None, pre_defined_mask=None, block_size=128):
     if video_mask.all():
@@ -303,6 +515,9 @@ def RadialAttention(query, key, value, mask_map=None, sparsity_type="radial", bl
     else:
         video_mask = mask_map.queryLogMask(query, sparsity_type, block_size=block_size, decay_factor=decay_factor, model_type=model_type) if mask_map else None
     
+    #TODO: logic and with scene level mask
+    
+
     backend = "sparse_sageattn" if use_sage_attention else "flashinfer"
     
     if backend == "flashinfer":
@@ -347,6 +562,7 @@ if __name__ == "__main__":
     # print("Indptr: ", indptr)
     video_token_num = 3840 * 30
     num_frame = 30
+    scene_boundaries = [0, 10, 20, 30]  # 3 scenes: frames 0-9, 10-19, 20-29
     token_per_frame = video_token_num / num_frame
     padded_video_token_num = ((video_token_num + 1) // 128 + 1) * 128
     print("padded: ", padded_video_token_num)
@@ -365,3 +581,67 @@ if __name__ == "__main__":
     plt.close()
     # save the mask tensor
     torch.save(temporal_mask, "temporal_mask.pt")
+    
+    # Test dynamic scene-level sparsity
+    video_token_num = 3840 * 30
+    num_frame = 30
+    scene_boundaries = [0, 10, 20, 30]  # 3 scenes: frames 0-9, 10-19, 20-29
+    
+    # Define scene adjacency matrix: 3x3 matrix for 3 scenes
+    # Scene 0 can attend to Scene 0 and Scene 1
+    # Scene 1 can attend to Scene 0, Scene 1, and Scene 2
+    # Scene 2 can attend to Scene 1 and Scene 2
+    scene_adjacency_matrix = [
+        [True, True, False],   # Scene 0 -> Scenes 0,1
+        [True, True, True],    # Scene 1 -> Scenes 0,1,2
+        [False, True, True]    # Scene 2 -> Scenes 1,2
+    ]
+    
+    token_per_frame = video_token_num / num_frame
+    padded_video_token_num = ((video_token_num + 1) // 128 + 1) * 128
+    
+    print("Testing dynamic scene-level sparsity...")
+    print(f"Scene boundaries: {scene_boundaries}")
+    print(f"Scene adjacency matrix:\n{scene_adjacency_matrix}")
+    
+    # Create scene-aware mask map
+    scene_mask_map = SceneAwareMaskMap(
+        video_token_num=video_token_num,
+        num_frame=num_frame,
+        scene_boundaries=scene_boundaries,
+        scene_adjacency_matrix=scene_adjacency_matrix
+    )
+    
+    # Generate scene-aware temporal mask (computed on-the-fly)
+    scene_temporal_mask = scene_mask_map.queryLogMask(
+        query, sparse_type="radial", decay_factor=1, model_type="hunyuan"
+    )
+    
+    # Generate regular temporal mask for comparison
+    regular_mask_map = MaskMap(video_token_num=video_token_num, num_frame=num_frame)
+    regular_temporal_mask = regular_mask_map.queryLogMask(
+        query, sparse_type="radial", decay_factor=1, model_type="hunyuan"
+    )
+    
+    # Visualize both masks
+    plt.figure(figsize=(15, 6), dpi=500)
+    
+    plt.subplot(1, 2, 1)
+    plt.imshow(regular_temporal_mask.cpu().numpy()[:, :], cmap='hot')
+    plt.colorbar()
+    plt.title("Regular Temporal Mask")
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(scene_temporal_mask.cpu().numpy()[:, :], cmap='hot')
+    plt.colorbar()
+    plt.title("Scene-Aware Temporal Mask")
+    
+    plt.tight_layout()
+    plt.savefig("scene_comparison_mask.png", dpi=300, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+    
+    # Save both masks
+    torch.save(scene_temporal_mask, "scene_temporal_mask.pt")
+    torch.save(regular_temporal_mask, "regular_temporal_mask.pt")
+    
+    print("Dynamic scene-aware mask generated and saved!")
