@@ -121,9 +121,38 @@ We support Text-to-Video inference of HunyuanVideo. The running script is:
 bash scripts/hunyuan_t2v_inference.sh
 ```
 
+## 🎯LoRA Length Extension Training
+
+We now support training LoRA adapters for video length extension! This enables extending pre-trained models to generate 4× longer videos with minimal training cost.
+
+### Quick Start
+
+```bash
+# Prepare training data
+python prepare_training_data.py create --output_dir training_data --num_samples 100
+
+# Train LoRA for length extension
+bash scripts/train_lora_length_extension.sh
+
+# Evaluate trained model
+bash scripts/evaluate_lora_comprehensive.sh lora_length_extension_checkpoints/best_model
+```
+
+### Key Features
+
+- **Efficient Training**: Only LoRA parameters are trained, requiring minimal computational resources
+- **Length Extension**: Supports extending videos from 69 frames to 161+ frames (2.3×+ extension)
+- **Quality Preservation**: Maintains video quality while extending temporal length
+- **Radial Attention Integration**: Uses sparse attention patterns for efficient long video generation
+
+See [docs/LORA_LENGTH_EXTENSION.md](docs/LORA_LENGTH_EXTENSION.md) for detailed documentation.
+
+```
+
 ## 📕Open-source Plan
 
 - [x] Integrate [Wan2.1_14B_FusionX LoRA](https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX) for high-quality few-step generation
+- [x] **LoRA Length Extension Training**: Complete training pipeline for video length extension
 - [ ] Adopt [Sparse-VideoGen](https://github.com/svg-project/Sparse-VideoGen/tree/main)'s fused kernels for further speedup
 - [ ] ComfyUI integration (in [ComfyUI-nunchaku](https://github.com/mit-han-lab/ComfyUI-nunchaku))
 - [ ] Support Mochi-1
