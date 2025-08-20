@@ -1,0 +1,46 @@
+{
+  "model_id": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+  "output_dir": "lora_checkpoints_production",
+  "learning_rate": 5e-5,
+  "batch_size": 2,
+  "num_epochs": 500,
+  "gradient_accumulation_steps": 8,
+  "max_grad_norm": 0.5,
+  "warmup_steps": 500,
+  
+  "lora_rank": 128,
+  "lora_alpha": 128,
+  "lora_dropout": 0.05,
+  "target_modules": [
+    "to_q", "to_k", "to_v", "to_out.0",
+    "proj_in", "proj_out",
+    "ff.net.0", "ff.net.2"
+  ],
+  
+  "base_num_frames": 69,
+  "extended_num_frames": 273,
+  "height": 768,
+  "width": 1280,
+  
+  "pattern": "radial",
+  "dense_layers": 3,
+  "dense_timesteps": 1,
+  "decay_factor": 0.15,
+  
+  "data_dir": "training_data_large",
+  "validation_split": 0.05,
+  
+  "save_every": 25,
+  "validate_every": 10,
+  "log_every": 5,
+  "use_wandb": true,
+  "wandb_project": "radial-attention-lora-production",
+  
+  "use_mixed_precision": true,
+  "use_gradient_checkpointing": true,
+  "use_sage_attention": true,
+  
+  "flow_shift": 5.0,
+  "num_inference_steps": 50,
+  "guidance_scale": 5.0
+}
